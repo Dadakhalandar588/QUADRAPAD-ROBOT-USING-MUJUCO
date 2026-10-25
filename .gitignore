@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+mujoco_env/
+
+# IDE
+.vscode/
+.idea/
+
+# Training outputs
+*.pt
+*.pth
+*.onnx
+
+# Logs
+logs/

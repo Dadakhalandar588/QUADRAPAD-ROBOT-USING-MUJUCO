@@ -1,0 +1,930 @@
+"""
+Go1 Pure PPO Trot Environment
+
+OBJECTIVE:
+    Learn quadruped locomotion using PPO without a predefined gait trajectory.
+
+REMOVED:
+    - Sine/cosine reference gait
+    - Fixed gait clock
+    - Prescribed swing timing
+    - Prescribed foot-contact schedule
+
+INCLUDED:
+    - PPO controls 12 joint targets
+    - Forward velocity reward
+    - Diagonal coordination reward
+    - Penalty for excessive flight
+    - Strong penalty when all four feet are airborne
+    - Foot clearance reward
+    - Balance and stability rewards
+    - Action smoothness penalty
+
+JOINT ORDER:
+    FR, FL, RR, RL
+    Each leg: hip, thigh, calf
+
+DIAGONAL PAIRS:
+    Pair A: FR + RL
+    Pair B: FL + RR
+
+IMPORTANT:
+    Reward design encourages trotting but does not guarantee it.
+"""
+
+import numpy as np
+import mujoco
+import gymnasium as gym
+
+from gymnasium import spaces
+
+
+FOOT_NAMES = ["FR", "FL", "RR", "RL"]
+
+
+class Go1TrotEnv(gym.Env):
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        xml_path="models/unitree_go1/scene.xml",
+        action_scale=0.50,
+        max_steps=1000
+    ):
+
+        super().__init__()
+
+        # -------------------------------------------------
+        # 1. LOAD MUJOCO MODEL
+        # -------------------------------------------------
+
+        self.model = mujoco.MjModel.from_xml_path(xml_path)
+        self.data = mujoco.MjData(self.model)
+
+        self.frame_skip = 10
+
+        self.dt = (
+            self.frame_skip
+            * self.model.opt.timestep
+        )
+
+        self.action_scale = float(action_scale)
+        self.max_steps = int(max_steps)
+
+        mujoco.mj_resetDataKeyframe(
+            self.model,
+            self.data,
+            0
+        )
+
+        # Standing pose
+
+        self.home = self.data.ctrl.copy()
+
+        if self.home.size != 12:
+            raise ValueError(
+                f"Expected 12 actuators, "
+                f"but model has {self.home.size}"
+            )
+
+        self.ctrl_lo = (
+            self.model.actuator_ctrlrange[:, 0].copy()
+        )
+
+        self.ctrl_hi = (
+            self.model.actuator_ctrlrange[:, 1].copy()
+        )
+
+        self.hip_idx = [0, 3, 6, 9]
+
+        # -------------------------------------------------
+        # 2. IDENTIFY FOOT GEOMETRIES
+        # -------------------------------------------------
+
+        self.foot_ids = [
+            mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                name
+            )
+            for name in FOOT_NAMES
+        ]
+
+        if -1 in self.foot_ids:
+            raise ValueError(
+                "Foot geoms FR/FL/RR/RL not found. "
+                "Check the names in your MuJoCo XML."
+            )
+
+        # -------------------------------------------------
+        # 3. ENVIRONMENT STATE
+        # -------------------------------------------------
+
+        self.command = np.array(
+            [0.45, 0.0, 0.0],
+            dtype=np.float64
+        )
+
+        self.last_action = np.zeros(
+            12,
+            dtype=np.float64
+        )
+
+        self.contact = np.zeros(
+            4,
+            dtype=bool
+        )
+
+        self.prev_contact = np.zeros(
+            4,
+            dtype=bool
+        )
+
+        # Verify this target against your actual model.
+
+        self.height_target = 0.26
+
+        self.steps = 0
+
+        # -------------------------------------------------
+        # 4. REWARD WEIGHTS
+        # -------------------------------------------------
+
+        # These are initial design choices.
+        # They may require tuning after training.
+
+        self.scales = {
+
+            # Move at the commanded forward/sideways speed.
+            "track_lin": 2.0,
+
+            # Follow the commanded turning rate.
+            "track_yaw": 0.5,
+
+            # Encourage members of each diagonal pair
+            # to share the same ground-contact state.
+            "diagonal_sync": 0.7,
+
+            # Encourage the two diagonal pairs to
+            # have different contact states.
+            "pair_alternation": 0.7,
+
+            # Encourage coordinated diagonal swing states.
+            "diagonal_swing": 0.5,
+
+            # Encourage coordinated contact transitions.
+            "diagonal_transition": 0.25,
+
+            # Reward feet that achieve clearance.
+            "foot_clearance": 0.25,
+
+            # Maintain the desired body height.
+            "height": 1.0,
+
+            # Penalise having more than two feet airborne.
+            "flight": -3.0,
+
+            # Strongly penalise all four feet airborne.
+            "all_feet_air": -8.0,
+
+            # Penalise planted-foot slipping.
+            "slip": -0.15,
+
+            # Penalise vertical bouncing.
+            "lin_vel_z": -1.0,
+
+            # Penalise excessive body rotation.
+            "ang_vel_xy": -0.08,
+
+            # Penalise body tilt.
+            "orientation": -1.5,
+
+            # Discourage excessive joint corrections.
+            "action": -0.01,
+
+            # Discourage abrupt action changes.
+            "action_rate": -0.02,
+
+            # Penalise excessive actuator forces.
+            "torques": -1e-5,
+
+            # Penalise excessive joint acceleration.
+            "dof_acc": -2.5e-7,
+        }
+
+        self.fall_penalty = -10.0
+
+        # -------------------------------------------------
+        # 5. ACTION SPACE
+        # -------------------------------------------------
+
+        # PPO controls all 12 joints directly.
+
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(12,),
+            dtype=np.float32
+        )
+
+        # -------------------------------------------------
+        # 6. OBSERVATION SPACE
+        # -------------------------------------------------
+
+        # Angular velocity:              3
+        # Gravity direction:              3
+        # Movement command:               3
+        # Joint positions:               12
+        # Joint velocities:              12
+        # Previous actions:              12
+        # Body linear velocity:           3
+        # Foot contacts:                  4
+        #
+        # TOTAL: 52 OBSERVATIONS
+
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(52,),
+            dtype=np.float32
+        )
+
+    # =====================================================
+    # 7. COORDINATE TRANSFORMATIONS
+    # =====================================================
+
+    def _world_to_body(self, vec):
+
+        inv = np.zeros(
+            4,
+            dtype=np.float64
+        )
+
+        mujoco.mju_negQuat(
+            inv,
+            self.data.qpos[3:7]
+        )
+
+        out = np.zeros(
+            3,
+            dtype=np.float64
+        )
+
+        mujoco.mju_rotVecQuat(
+            out,
+            np.asarray(
+                vec,
+                dtype=np.float64
+            ),
+            inv
+        )
+
+        return out
+
+    def _gravity_in_body(self):
+
+        return self._world_to_body(
+            [0.0, 0.0, -1.0]
+        )
+
+    def _lin_vel_body(self):
+
+        return self._world_to_body(
+            self.data.qvel[0:3]
+        )
+
+    # =====================================================
+    # 8. FOOT CONTACT DETECTION
+    # =====================================================
+
+    def _foot_contact(self):
+
+        contact = np.zeros(
+            4,
+            dtype=bool
+        )
+
+        for i in range(self.data.ncon):
+
+            c = self.data.contact[i]
+
+            for k, gid in enumerate(self.foot_ids):
+
+                if (
+                    c.geom1 == gid
+                    or c.geom2 == gid
+                ):
+
+                    contact[k] = True
+
+        return contact
+
+    # =====================================================
+    # 9. FOOT VELOCITY
+    # =====================================================
+
+    def _foot_speed_xy(self):
+
+        speeds = np.zeros(
+            4,
+            dtype=np.float64
+        )
+
+        res = np.zeros(
+            6,
+            dtype=np.float64
+        )
+
+        for k, gid in enumerate(self.foot_ids):
+
+            mujoco.mj_objectVelocity(
+                self.model,
+                self.data,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                gid,
+                res,
+                0
+            )
+
+            # Translational velocity components.
+
+            speeds[k] = np.linalg.norm(
+                res[3:5]
+            )
+
+        return speeds
+
+    # =====================================================
+    # 10. OBSERVATIONS GIVEN TO PPO
+    # =====================================================
+
+    def _get_obs(self):
+
+        obs = np.concatenate([
+
+            # Body angular velocity.
+            self.data.qvel[3:6] * 0.25,
+
+            # Body orientation information.
+            self._gravity_in_body(),
+
+            # Desired forward, sideways and turning commands.
+            self.command
+            * np.array([2.0, 2.0, 0.25]),
+
+            # Joint positions relative to the home pose.
+            self.data.qpos[7:] - self.home,
+
+            # Joint velocities.
+            self.data.qvel[6:] * 0.05,
+
+            # Previous policy actions.
+            self.last_action,
+
+            # Body linear velocity.
+            self._lin_vel_body() * 2.0,
+
+            # Ground-contact state of four feet.
+            self.contact.astype(np.float64),
+
+        ])
+
+        return obs.astype(np.float32)
+
+    # =====================================================
+    # 11. DIAGONAL COORDINATION
+    # =====================================================
+
+    @staticmethod
+    def _trot_coordination(contact):
+
+        """
+        Contact order:
+            FR, FL, RR, RL
+
+        Diagonal pair A:
+            FR + RL
+
+        Diagonal pair B:
+            FL + RR
+
+        This provides reward feedback.
+        It does not prescribe a gait clock.
+        """
+
+        c = np.asarray(
+            contact,
+            dtype=np.float64
+        )
+
+        fr, fl, rr, rl = c
+
+        # Each diagonal pair should have matching
+        # contact states.
+
+        diagonal_sync = 1.0 - 0.5 * (
+            abs(fr - rl)
+            + abs(fl - rr)
+        )
+
+        # Average contact state of each pair.
+
+        pair_a = 0.5 * (fr + rl)
+
+        pair_b = 0.5 * (fl + rr)
+
+        # Reward different contact states between pairs.
+
+        pair_alternation = abs(
+            pair_a - pair_b
+        )
+
+        return (
+            float(diagonal_sync),
+            float(pair_alternation)
+        )
+
+    # =====================================================
+    # 12. REWARD FUNCTION
+    # =====================================================
+
+    def _compute_reward(
+        self,
+        action,
+        contact
+    ):
+
+        s = self.scales
+
+        lin_vel = self._lin_vel_body()
+
+        ang_vel = self.data.qvel[3:6]
+
+        gravity = self._gravity_in_body()
+
+        z = float(
+            self.data.qpos[2]
+        )
+
+        # -------------------------------------------------
+        # A. FORWARD MOVEMENT REWARD
+        # -------------------------------------------------
+
+        lin_err = (
+            (lin_vel[0] - self.command[0]) ** 2
+            +
+            (lin_vel[1] - self.command[1]) ** 2
+        )
+
+        track_lin = (
+            s["track_lin"]
+            * np.exp(-lin_err / 0.1)
+        )
+
+        # -------------------------------------------------
+        # B. TURNING REWARD
+        # -------------------------------------------------
+
+        track_yaw = (
+            s["track_yaw"]
+            * np.exp(
+                -(
+                    ang_vel[2]
+                    - self.command[2]
+                ) ** 2 / 0.1
+            )
+        )
+
+        # -------------------------------------------------
+        # C. DIAGONAL CONTACT REWARD
+        # -------------------------------------------------
+
+        diagonal_sync, pair_alternation = (
+            self._trot_coordination(contact)
+        )
+
+        diagonal_sync_reward = (
+            s["diagonal_sync"]
+            * diagonal_sync
+        )
+
+        alternation_reward = (
+            s["pair_alternation"]
+            * pair_alternation
+        )
+
+        # -------------------------------------------------
+        # D. DIAGONAL SWING COORDINATION
+        # -------------------------------------------------
+
+        in_air = ~np.asarray(
+            contact,
+            dtype=bool
+        )
+
+        fr, fl, rr, rl = (
+            in_air.astype(np.float64)
+        )
+
+        diagonal_swing_score = 1.0 - 0.5 * (
+            abs(fr - rl)
+            + abs(fl - rr)
+        )
+
+        diagonal_swing_reward = (
+            s["diagonal_swing"]
+            * diagonal_swing_score
+        )
+
+        # -------------------------------------------------
+        # E. COORDINATED CONTACT TRANSITIONS
+        # -------------------------------------------------
+
+        prev_in_air = ~np.asarray(
+            self.prev_contact,
+            dtype=bool
+        )
+
+        current_in_air = in_air
+
+        changed = (
+            current_in_air != prev_in_air
+        )
+
+        fr_change, fl_change, rr_change, rl_change = (
+            changed.astype(np.float64)
+        )
+
+        transition_score = 1.0 - 0.5 * (
+            abs(fr_change - rl_change)
+            + abs(fl_change - rr_change)
+        )
+
+        diagonal_transition_reward = (
+            s["diagonal_transition"]
+            * transition_score
+        )
+
+        # -------------------------------------------------
+        # F. PREVENT ALL FOUR FEET FROM LIFTING
+        # -------------------------------------------------
+
+        n_air = int(
+            4 - np.sum(contact)
+        )
+
+        # Penalise having more than two feet airborne.
+
+        flight = (
+            s["flight"]
+            * max(0, n_air - 2)
+        )
+
+        # Strong additional penalty when all four
+        # feet leave the ground simultaneously.
+
+        all_feet_air = (
+            s["all_feet_air"]
+            if n_air == 4
+            else 0.0
+        )
+
+        # -------------------------------------------------
+        # G. FOOT CLEARANCE
+        # -------------------------------------------------
+
+        foot_z = self.data.geom_xpos[
+            self.foot_ids,
+            2
+        ]
+
+        # Initial clearance threshold.
+        # Verify against the actual model geometry.
+
+        clearance = np.maximum(
+            foot_z - 0.03,
+            0.0
+        )
+
+        # Reward airborne feet that have clearance.
+
+        foot_clearance = (
+            s["foot_clearance"]
+            * float(
+                np.sum(
+                    clearance * in_air
+                )
+            )
+        )
+
+        # -------------------------------------------------
+        # H. BODY HEIGHT
+        # -------------------------------------------------
+
+        height = (
+            s["height"]
+            * np.exp(
+                -(
+                    (z - self.height_target) / 0.04
+                ) ** 2
+            )
+        )
+
+        # -------------------------------------------------
+        # I. FOOT SLIPPING
+        # -------------------------------------------------
+
+        slip = (
+            s["slip"]
+            * np.sum(
+                contact
+                * self._foot_speed_xy() ** 2
+            )
+        )
+
+        # -------------------------------------------------
+        # J. VERTICAL BOUNCING
+        # -------------------------------------------------
+
+        lin_vel_z = (
+            s["lin_vel_z"]
+            * lin_vel[2] ** 2
+        )
+
+        # -------------------------------------------------
+        # K. BODY ROTATION
+        # -------------------------------------------------
+
+        ang_vel_xy = (
+            s["ang_vel_xy"]
+            * np.sum(
+                ang_vel[:2] ** 2
+            )
+        )
+
+        # -------------------------------------------------
+        # L. BODY ORIENTATION
+        # -------------------------------------------------
+
+        orientation = (
+            s["orientation"]
+            * np.sum(
+                gravity[:2] ** 2
+            )
+        )
+
+        # -------------------------------------------------
+        # M. ACTION MAGNITUDE
+        # -------------------------------------------------
+
+        action_penalty = (
+            s["action"]
+            * np.sum(action ** 2)
+        )
+
+        # -------------------------------------------------
+        # N. ACTION SMOOTHNESS
+        # -------------------------------------------------
+
+        action_rate = (
+            s["action_rate"]
+            * np.sum(
+                (action - self.last_action) ** 2
+            )
+        )
+
+        # -------------------------------------------------
+        # O. TORQUE PENALTY
+        # -------------------------------------------------
+
+        torques = (
+            s["torques"]
+            * np.sum(
+                self.data.actuator_force ** 2
+            )
+        )
+
+        # -------------------------------------------------
+        # P. JOINT ACCELERATION PENALTY
+        # -------------------------------------------------
+
+        dof_acc = (
+            s["dof_acc"]
+            * np.sum(
+                self.data.qacc[6:] ** 2
+            )
+        )
+
+        # -------------------------------------------------
+        # Q. TOTAL REWARD
+        # -------------------------------------------------
+
+        total = (
+
+            track_lin
+            + track_yaw
+
+            + diagonal_sync_reward
+            + alternation_reward
+            + diagonal_swing_reward
+            + diagonal_transition_reward
+
+            + foot_clearance
+            + height
+
+            + flight
+            + all_feet_air
+
+            + slip
+            + lin_vel_z
+            + ang_vel_xy
+            + orientation
+
+            + action_penalty
+            + action_rate
+
+            + torques
+            + dof_acc
+        )
+
+        # Useful values for training diagnostics.
+
+        info = {
+
+            "vx": float(lin_vel[0]),
+
+            "z": z,
+
+            "diagonal_sync": diagonal_sync,
+
+            "pair_alternation": pair_alternation,
+
+            "diagonal_swing_score": (
+                diagonal_swing_score
+            ),
+
+            "diagonal_transition_score": (
+                transition_score
+            ),
+
+            "foot_clearance": float(
+                np.sum(
+                    clearance * in_air
+                )
+            ),
+
+            "n_air": n_air,
+
+            "all_feet_air": bool(
+                n_air == 4
+            ),
+        }
+
+        return float(total), info
+
+    # =====================================================
+    # 13. RESET ENVIRONMENT
+    # =====================================================
+
+    def reset(
+        self,
+        seed=None,
+        options=None
+    ):
+
+        super().reset(seed=seed)
+
+        mujoco.mj_resetDataKeyframe(
+            self.model,
+            self.data,
+            0
+        )
+
+        mujoco.mj_forward(
+            self.model,
+            self.data
+        )
+
+        # Randomise desired forward speed.
+
+        self.command = np.array(
+            [
+                self.np_random.uniform(0.3, 0.6),
+                0.0,
+                0.0
+            ],
+            dtype=np.float64
+        )
+
+        if options and "command" in options:
+
+            self.command = np.asarray(
+                options["command"],
+                dtype=np.float64
+            )
+
+        self.last_action[:] = 0.0
+
+        self.contact = self._foot_contact()
+
+        self.prev_contact = (
+            self.contact.copy()
+        )
+
+        self.steps = 0
+
+        return self._get_obs(), {}
+
+    # =====================================================
+    # 14. STEP ENVIRONMENT
+    # =====================================================
+
+    def step(self, action):
+
+        # Keep actions within the valid range.
+
+        action = np.clip(
+            np.asarray(
+                action,
+                dtype=np.float64
+            ),
+            -1.0,
+            1.0
+        )
+
+        # PURE PPO CONTROL:
+        # No predefined gait or reference trajectory.
+        #
+        # PPO directly controls all 12 joint target offsets.
+
+        ctrl = (
+            self.home
+            + self.action_scale * action
+        )
+
+        # Respect actuator control limits.
+
+        self.data.ctrl[:] = np.clip(
+            ctrl,
+            self.ctrl_lo,
+            self.ctrl_hi
+        )
+
+        # Advance MuJoCo simulation.
+
+        for _ in range(self.frame_skip):
+
+            mujoco.mj_step(
+                self.model,
+                self.data
+            )
+
+        self.steps += 1
+
+        # Update contacts after simulation.
+
+        self.prev_contact = (
+            self.contact.copy()
+        )
+
+        self.contact = self._foot_contact()
+
+        # Calculate reward.
+
+        reward, info = self._compute_reward(
+            action,
+            self.contact
+        )
+
+        self.last_action = action.copy()
+
+        # -------------------------------------------------
+        # FALL DETECTION
+        # -------------------------------------------------
+
+        gravity = self._gravity_in_body()
+
+        fell = bool(
+            gravity[2] > -0.5
+            or self.data.qpos[2] < 0.15
+        )
+
+        truncated = (
+            self.steps >= self.max_steps
+        )
+
+        if fell:
+
+            reward += self.fall_penalty
+
+        # All-four-feet flight is strongly penalised.
+        # It does not terminate the episode by itself.
+
+        return (
+            self._get_obs(),
+            float(reward),
+            fell,
+            truncated,
+            info
+        )
